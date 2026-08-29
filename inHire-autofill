@@ -1,0 +1,466 @@
+// ==UserScript==
+// @name         InHire Autofill
+// @namespace    chris.jobsearch.inhire
+// @version      4.0
+// @description  Preenche automaticamente formulários de candidatura em páginas InHire
+// @match        *://*.inhire.app/*
+// @match        *://inhire.app/*
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  if (!location.href.includes('inhire.app')) return;
+
+  console.log('[InHire Autofill] script carregado em', location.href);
+
+  // ---------------------------------------------------------------------
+  // 1. DADOS FIXOS
+  // ---------------------------------------------------------------------
+const DATA = {
+  fullName: 'Fulano da Silva',
+  firstName: 'Fulano',
+  lastName: 'da Silva',
+  cpf: '000.000.000-00',
+  email: 'usuario@exemplo.com',
+  phone: '11999999999',
+  linkedin: 'https://www.linkedin.com/in/seu-usuario/',
+  country: 'Brasil',
+  city: 'São Paulo - SP',
+  salaryExpectation: 'R$ 10.000,00',
+};
+
+  // ---------------------------------------------------------------------
+  // 2. IDENTIFICAÇÃO DOS CAMPOS
+  // ---------------------------------------------------------------------
+  const KEYWORD_MAP = [
+    { key: 'firstName', keywords: ['primeiro nome', 'first name', 'firstname'] },
+    { key: 'lastName', keywords: ['sobrenome', 'last name', 'lastname'] },
+    { key: 'fullName', keywords: ['nome completo', 'full name', 'nome'] },
+    { key: 'cpf', keywords: ['cpf'] },
+    { key: 'email', keywords: ['e-mail', 'email'] },
+    { key: 'phone', keywords: ['celular', 'telefone', 'whatsapp', 'phone'] },
+    { key: 'linkedin', keywords: ['linkedin'] },
+    { key: 'country', keywords: ['país', 'pais', 'country'] },
+    { key: 'city', keywords: ['cidade', 'localização', 'localizacao', 'location'] },
+    {
+      key: 'salaryExpectation',
+      keywords: [
+        'pretensão salarial',
+        'pretensao salarial',
+        'salário',
+        'salary',
+      ],
+    },
+  ];
+
+  const SKIP_KEYWORDS = [
+    'currículo',
+    'curriculo',
+    'resume',
+    'cv',
+    'carta de apresentação',
+    'cover letter',
+    'anexar',
+    'senha',
+    'password',
+  ];
+
+  // ---------------------------------------------------------------------
+  // 3. HELPERS
+  // ---------------------------------------------------------------------
+  function getFieldLabelText(el) {
+    let text = '';
+
+    try {
+      if (el.id) {
+        const label = document.querySelector(
+          `label[for="${CSS.escape(el.id)}"]`
+        );
+
+        if (label) text += ` ${label.textContent}`;
+      }
+
+      const wrappingLabel = el.closest('label');
+      if (wrappingLabel) text += ` ${wrappingLabel.textContent}`;
+
+      text += ` ${el.getAttribute('placeholder') || ''}`;
+      text += ` ${el.getAttribute('aria-label') || ''}`;
+      text += ` ${el.getAttribute('name') || ''}`;
+      text += ` ${el.id || ''}`;
+
+      const container = el.closest('div, fieldset');
+
+      if (container) {
+        const possibleLabel = container.querySelector(
+          'label, [class*="label" i]'
+        );
+
+        if (possibleLabel?.textContent) {
+          text += ` ${possibleLabel.textContent}`;
+        }
+      }
+    } catch (error) {
+      // Ignora campos que não possam ser analisados.
+    }
+
+    return text.toLowerCase();
+  }
+
+  function normalizeText(text) {
+    return String(text || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .trim();
+  }
+
+  function isVisible(el) {
+    try {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== 'hidden' &&
+        style.display !== 'none'
+      );
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function setNativeValue(el, value) {
+    try {
+      const proto =
+        el.tagName === 'TEXTAREA'
+          ? window.HTMLTextAreaElement.prototype
+          : window.HTMLInputElement.prototype;
+
+      const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+
+      if (setter) {
+        setter.call(el, value);
+      } else {
+        el.value = value;
+      }
+
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
+    } catch (error) {
+      // Ignora campos que não possam receber valor.
+    }
+  }
+
+  // Para o input de pesquisa interno de um dropdown React.
+  // Não dispara blur, pois isso poderia fechar o menu antes da seleção.
+  function setNativeSearchValue(el, value) {
+    try {
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        'value'
+      )?.set;
+
+      if (setter) {
+        setter.call(el, value);
+      } else {
+        el.value = value;
+      }
+
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    } catch (error) {
+      // Ignora campos que não possam receber valor.
+    }
+  }
+
+  function identifyField(el) {
+    const labelText = getFieldLabelText(el);
+    const name = (el.getAttribute('name') || '').toLowerCase();
+    const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+
+    if (name === 'document.value' || placeholder === '000.000.000-00') {
+      return { key: 'cpf', labelText };
+    }
+
+    for (const { key, keywords } of KEYWORD_MAP) {
+      if (keywords.some((keyword) => labelText.includes(keyword))) {
+        return { key, labelText };
+      }
+    }
+
+    return { key: null, labelText };
+  }
+
+  function formatBrazilPhone(phone) {
+    const digits = String(phone).replace(/\D/g, '');
+
+    return digits.startsWith('55')
+      ? `+${digits}`
+      : `+55${digits}`;
+  }
+
+  // ---------------------------------------------------------------------
+  // 4. DROPDOWNS REACT: PAÍS E CIDADE
+  // ---------------------------------------------------------------------
+  let countryRetryTimer = null;
+  let cityRetryTimer = null;
+
+  function scheduleCountryRetry() {
+    if (countryRetryTimer) return;
+
+    countryRetryTimer = setTimeout(() => {
+      countryRetryTimer = null;
+      fillCountrySelect();
+    }, 250);
+  }
+
+  function scheduleCityRetry() {
+    if (cityRetryTimer) return;
+
+    cityRetryTimer = setTimeout(() => {
+      cityRetryTimer = null;
+      fillCitySelect();
+    }, 250);
+  }
+
+  function isCountrySelected() {
+    const countryInput = document.querySelector('input[name="country"]');
+    const dropdown = countryInput?.closest('.react-dropdown-select');
+
+    const valuesToCheck = [
+      countryInput?.value,
+      dropdown?.querySelector('.react-dropdown-select-content')?.textContent,
+    ];
+
+    // A InHire pode exibir "Brazil (BR)", mesmo com a página em português.
+    // A validação usa o código BR, e não o texto traduzido.
+    return valuesToCheck.some((value) => {
+      const text = String(value || '').trim();
+
+      return text.toUpperCase() === 'BR' || /\(\s*BR\s*\)/i.test(text);
+    });
+  }
+
+  function fillCountrySelect() {
+    const countryInput = document.querySelector('input[name="country"]');
+    if (!countryInput) return;
+
+    const dropdown = countryInput.closest('.react-dropdown-select');
+    if (!dropdown) return;
+
+    if (isCountrySelected()) {
+      fillCitySelect();
+      return;
+    }
+
+    const isOpen = dropdown.getAttribute('aria-expanded') === 'true';
+
+    if (!isOpen) {
+      dropdown.click();
+      scheduleCountryRetry();
+      return;
+    }
+
+    // Escopo limitado ao dropdown de País de origem.
+    const brazilOption = dropdown.querySelector(
+      'button[role="option"][data-option-value="BR"]'
+    );
+
+    if (!brazilOption) {
+      scheduleCountryRetry();
+      return;
+    }
+
+    brazilOption.click();
+
+    console.log('[InHire Autofill] país preenchido: Brasil');
+
+    // Após o clique, o React substitui o input district
+    // pelo dropdown div#districtBr.
+    scheduleCityRetry();
+  }
+
+  function isCitySelected(dropdown, cityOutput) {
+    const selectedText = normalizeText(
+      dropdown.querySelector('.react-dropdown-select-content')?.textContent
+    );
+
+    const outputValue = normalizeText(cityOutput?.value);
+    const targetCity = normalizeText(DATA.city);
+
+    // O texto visual é obrigatório para evitar falso positivo
+    // caso o input invisível tenha recebido valor sem seleção React.
+    return (
+      selectedText.includes(targetCity) &&
+      outputValue === targetCity
+    );
+  }
+
+  function fillCitySelect() {
+    if (!isCountrySelected()) {
+      scheduleCityRetry();
+      return;
+    }
+
+    // Antes do país ser selecionado existe apenas input[name="district"].
+    // Após a seleção, a cidade passa a ser o dropdown #districtBr.
+    const cityContainer = document.querySelector('div#districtBr');
+
+    if (!cityContainer) {
+      scheduleCityRetry();
+      return;
+    }
+
+    // Este input é apenas a saída invisível do componente.
+    // Ele serve como âncora para localizar o dropdown correto.
+    const cityOutput = cityContainer.querySelector(
+      'input[name="districtBr"]'
+    );
+
+    const dropdown = cityOutput?.closest('.react-dropdown-select');
+
+    if (!dropdown) {
+      scheduleCityRetry();
+      return;
+    }
+
+    if (isCitySelected(dropdown, cityOutput)) {
+      return;
+    }
+
+    const isOpen = dropdown.getAttribute('aria-expanded') === 'true';
+
+    if (!isOpen) {
+      dropdown.click();
+      scheduleCityRetry();
+      return;
+    }
+
+    // Campo de pesquisa temporário criado somente com o menu aberto.
+    const searchContainer = dropdown.querySelector(
+      '[data-component-name="DropdownOptionsSearch"]'
+    );
+
+    const searchInput = searchContainer?.querySelector('input');
+
+    if (!searchInput) {
+      scheduleCityRetry();
+      return;
+    }
+
+    if (searchInput.value !== DATA.city) {
+      setNativeSearchValue(searchInput, DATA.city);
+    }
+
+    // A lista é filtrada de forma assíncrona pelo React.
+    const cityOption = dropdown.querySelector(
+      `button[role="option"][data-option-value="${CSS.escape(DATA.city)}"]`
+    );
+
+    if (!cityOption) {
+      scheduleCityRetry();
+      return;
+    }
+
+    cityOption.click();
+
+    console.log(`[InHire Autofill] cidade preenchida: ${DATA.city}`);
+  }
+
+  // ---------------------------------------------------------------------
+  // 5. PREENCHIMENTO DOS INPUTS CONVENCIONAIS
+  // ---------------------------------------------------------------------
+  const filledElements = new WeakSet();
+
+  function fillForm() {
+    let candidates = [];
+
+    try {
+      candidates = Array.from(
+        document.querySelectorAll('input, textarea')
+      ).filter(
+        (el) =>
+          isVisible(el) &&
+          ![
+            'checkbox',
+            'radio',
+            'file',
+            'hidden',
+            'submit',
+            'button',
+          ].includes((el.type || '').toLowerCase())
+      );
+    } catch (error) {
+      return;
+    }
+
+    for (const el of candidates) {
+      if (filledElements.has(el)) continue;
+
+      const { key, labelText } = identifyField(el);
+
+      if (!key) continue;
+
+      if (SKIP_KEYWORDS.some((keyword) => labelText.includes(keyword))) {
+        continue;
+      }
+
+      // País e cidade exigem um fluxo específico de dropdown React.
+      // Não podem ser marcados como preenchidos pela varredura genérica.
+      if (key === 'country' || key === 'city') {
+        continue;
+      }
+
+      if (el.value && key !== 'phone') {
+        filledElements.add(el);
+        continue;
+      }
+
+      let value = DATA[key];
+
+      if (key === 'phone') {
+        value = formatBrazilPhone(DATA.phone);
+      }
+
+      if (!value) continue;
+
+      setNativeValue(el, value);
+      filledElements.add(el);
+
+      console.log(
+        `[InHire Autofill] preenchido "${key}" no campo:`,
+        labelText.trim().slice(0, 60)
+      );
+    }
+
+    fillCountrySelect();
+    fillCitySelect();
+  }
+
+  // ---------------------------------------------------------------------
+  // 6. EXECUÇÃO E OBSERVAÇÃO DE MUDANÇAS
+  // ---------------------------------------------------------------------
+  let debounceTimer = null;
+
+  function scheduleFill() {
+    clearTimeout(debounceTimer);
+
+    debounceTimer = setTimeout(fillForm, 400);
+  }
+
+  try {
+    const observer = new MutationObserver(scheduleFill);
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+  } catch (error) {
+    // O preenchimento inicial ainda será tentado.
+  }
+
+  scheduleFill();
+})();
